@@ -162,7 +162,7 @@ def run_download(job_id, url, format_choice, format_id):
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
     cmd = ["yt-dlp", "--no-playlist", "--continue", "--retries", "20",
-           "--fragment-retries", "20", "--newline", "--progress-template",
+           "--fragment-retries", "20", "--concurrent-fragments", "8", "--newline", "--progress-template",
            "download:PROG|%(info.vcodec)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s"
            "|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
            "-o", out_template]
@@ -185,19 +185,22 @@ def run_download(job_id, url, format_choice, format_id):
         reader.start()
         threading.Thread(target=read_progress, args=(job, proc.stdout), daemon=True).start()
 
-        # No total time limit: only kill it when the file stops growing.
-        last_size, last_change = partial_size(job_id), time.time()
+        # No total time limit: only restart it when it barely moves
+        # (under 1 MB in STALL_SECONDS), which also catches a slow trickle.
+        window_size, window_start = partial_size(job_id), time.time()
         while proc.poll() is None:
             time.sleep(5)
             size = partial_size(job_id)
-            if size != last_size:
-                last_size, last_change = size, time.time()
-                job["bytes"] = size
-            elif time.time() - last_change > STALL_SECONDS:
-                proc.kill()
-                proc.wait()
-                job["error"] = f"Stalled for {STALL_SECONDS}s, retrying"
-                return False
+            job["bytes"] = size
+            if (job.get("progress") or {}).get("stage") == "finishing":
+                window_size, window_start = size, time.time()
+            elif time.time() - window_start > STALL_SECONDS:
+                if size - window_size < 1024 * 1024:
+                    proc.kill()
+                    proc.wait()
+                    job["error"] = f"Almost no progress in {STALL_SECONDS}s, retrying"
+                    return False
+                window_size, window_start = size, time.time()
         reader.join(timeout=5)
         job.pop("proc", None)
 
