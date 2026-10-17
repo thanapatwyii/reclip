@@ -1,7 +1,9 @@
 import os
-import uuid
+import time
 import glob
 import json
+import shutil
+import hashlib
 import subprocess
 import threading
 from flask import Flask, request, jsonify, send_file, render_template
@@ -10,7 +12,90 @@ app = Flask(__name__)
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+SAVE_DIR = os.path.expanduser(os.environ.get("RECLIP_SAVE_DIR", "~/Downloads"))
+QUEUE_FILE = os.path.join(DOWNLOAD_DIR, "queue.json")
+MAX_ATTEMPTS = int(os.environ.get("RECLIP_MAX_ATTEMPTS", 50))
+STALL_SECONDS = int(os.environ.get("RECLIP_STALL_SECONDS", 180))
+MAX_PARALLEL = int(os.environ.get("RECLIP_PARALLEL", 4))
+
+# Errors that retrying will never fix: stop after 3 tries instead of 50.
+PERMANENT_ERRORS = ("Unsupported URL", "Video unavailable", "Private video", "not available",
+                    "This video has been removed", "HTTP Error 404", "HTTP Error 410")
+
 jobs = {}
+jobs_lock = threading.RLock()
+slots = threading.Semaphore(MAX_PARALLEL)
+
+
+def save_queue():
+    """Persist jobs so unfinished downloads survive a server restart."""
+    with jobs_lock:
+        data = {k: {f: v for f, v in list(j.items()) if f != "proc"} for k, j in list(jobs.items())}
+        tmp = QUEUE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=1)
+        os.replace(tmp, QUEUE_FILE)
+
+
+def load_queue():
+    if not os.path.exists(QUEUE_FILE):
+        return
+    try:
+        with open(QUEUE_FILE) as fh:
+            jobs.update(json.load(fh))
+    except (OSError, ValueError):
+        return
+    for job_id, job in jobs.items():
+        if job["status"] in ("queued", "downloading", "retrying"):
+            start_worker(job_id)
+
+
+def job_key(url, format_choice, format_id):
+    """Same video + same format = same job, so it resumes the same .part file."""
+    raw = f"{url}|{format_choice}|{format_id or ''}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:10]
+
+
+def partial_size(job_id):
+    return sum(os.path.getsize(f) for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
+               if os.path.isfile(f))
+
+
+def unique_path(path):
+    base, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(path):
+        path = f"{base} ({n}){ext}"
+        n += 1
+    return path
+
+
+def start_worker(job_id):
+    thread = threading.Thread(target=download_until_done, args=(job_id,))
+    thread.daemon = True
+    thread.start()
+
+
+def download_until_done(job_id):
+    """Retry (resuming the partial file) until the download succeeds."""
+    job = jobs[job_id]
+    with slots:
+        while job["status"] not in ("done", "cancelled"):
+            job["attempts"] = job.get("attempts", 0) + 1
+            job["status"] = "downloading"
+            save_queue()
+            if run_download(job_id, job["url"], job["format"], job.get("format_id")):
+                return
+            if job["status"] == "cancelled":
+                return
+            hopeless = any(p in (job.get("error") or "") for p in PERMANENT_ERRORS)
+            if job["attempts"] >= MAX_ATTEMPTS or (hopeless and job["attempts"] >= 3):
+                job["status"] = "error"
+                save_queue()
+                return
+            job["status"] = "retrying"
+            save_queue()
+            time.sleep(min(10 * job["attempts"], 120))
 
 
 def parse_ytdlp_json(stdout):
@@ -33,7 +118,8 @@ def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
+    cmd = ["yt-dlp", "--no-playlist", "--continue", "--retries", "20",
+           "--fragment-retries", "20", "-o", out_template]
 
     if format_choice == "audio":
         cmd += ["-x", "--audio-format", "mp3"]
@@ -45,48 +131,71 @@ def run_download(job_id, url, format_choice, format_id):
     cmd.append(url)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            job["status"] = "error"
-            job["error"] = result.stderr.strip().split("\n")[-1]
-            return
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        job["proc"] = proc
+        stderr_lines = []
+        reader = threading.Thread(target=lambda: stderr_lines.extend(proc.stderr), daemon=True)
+        reader.start()
 
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
+        # No total time limit: only kill it when the file stops growing.
+        last_size, last_change = partial_size(job_id), time.time()
+        while proc.poll() is None:
+            time.sleep(5)
+            size = partial_size(job_id)
+            if size != last_size:
+                last_size, last_change = size, time.time()
+                job["bytes"] = size
+            elif time.time() - last_change > STALL_SECONDS:
+                proc.kill()
+                proc.wait()
+                job["error"] = f"Stalled for {STALL_SECONDS}s, retrying"
+                return False
+        reader.join(timeout=5)
+        job.pop("proc", None)
+
+        if proc.returncode != 0:
+            lines = [l.strip() for l in stderr_lines if l.strip()]
+            job["error"] = lines[-1] if lines else f"yt-dlp exited with {proc.returncode}"
+            return False
+
+        files = [f for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
+                 if not f.endswith((".part", ".ytdl"))]
         if not files:
-            job["status"] = "error"
             job["error"] = "Download completed but no file was found"
-            return
+            return False
 
-        if format_choice == "audio":
-            target = [f for f in files if f.endswith(".mp3")]
-            chosen = target[0] if target else files[0]
-        else:
-            target = [f for f in files if f.endswith(".mp4")]
-            chosen = target[0] if target else files[0]
+        want = ".mp3" if format_choice == "audio" else ".mp4"
+        target = [f for f in files if f.endswith(want)]
+        chosen = target[0] if target else files[0]
 
-        for f in files:
+        for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*")):
             if f != chosen:
                 try:
                     os.remove(f)
                 except OSError:
                     pass
 
-        job["status"] = "done"
-        job["file"] = chosen
         ext = os.path.splitext(chosen)[1]
         title = job.get("title", "").strip()
-        # Sanitize title for filename
-        if title:
-            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:100].strip()
-            job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
-        else:
-            job["filename"] = os.path.basename(chosen)
-    except subprocess.TimeoutExpired:
-        job["status"] = "error"
-        job["error"] = "Download timed out (5 min limit)"
+        safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:100].strip()
+        filename = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
+
+        # Save straight into ~/Downloads.
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        dest = unique_path(os.path.join(SAVE_DIR, filename))
+        shutil.move(chosen, dest)
+
+        job["status"] = "done"
+        job["file"] = dest
+        job["filename"] = os.path.basename(dest)
+        job["error"] = None
+        save_queue()
+        return True
     except Exception as e:
-        job["status"] = "error"
         job["error"] = str(e)
+        return False
+    finally:
+        job.pop("proc", None)
 
 
 @app.route("/")
@@ -174,12 +283,18 @@ def start_download():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
+    job_id = job_key(url, format_choice, format_id)
+    existing = jobs.get(job_id)
+    if existing and existing["status"] in ("queued", "downloading", "retrying"):
+        return jsonify({"job_id": job_id})  # another tab already has it
+    if existing and existing["status"] == "done" and os.path.exists(existing.get("file", "")):
+        return jsonify({"job_id": job_id})
 
-    thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
-    thread.daemon = True
-    thread.start()
+    with jobs_lock:
+        jobs[job_id] = {"status": "queued", "url": url, "title": title, "format": format_choice,
+                        "format_id": format_id, "attempts": 0, "added": time.time()}
+    save_queue()
+    start_worker(job_id)
 
     return jsonify({"job_id": job_id})
 
@@ -189,11 +304,39 @@ def check_status(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    return jsonify({
+    return jsonify(job_summary(job_id, job))
+
+
+def job_summary(job_id, job):
+    return {
+        "id": job_id,
         "status": job["status"],
         "error": job.get("error"),
         "filename": job.get("filename"),
-    })
+        "title": job.get("title"),
+        "url": job.get("url"),
+        "attempts": job.get("attempts", 0),
+        "bytes": job.get("bytes", 0),
+    }
+
+
+@app.route("/api/jobs")
+def list_jobs():
+    items = sorted(jobs.items(), key=lambda kv: kv[1].get("added", 0), reverse=True)
+    return jsonify([job_summary(k, j) for k, j in items])
+
+
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+def cancel_job(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    job["status"] = "cancelled"
+    proc = job.get("proc")
+    if proc:
+        proc.kill()
+    save_queue()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/file/<job_id>")
@@ -203,6 +346,8 @@ def download_file(job_id):
         return jsonify({"error": "File not ready"}), 404
     return send_file(job["file"], as_attachment=True, download_name=job["filename"])
 
+
+load_queue()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8899))

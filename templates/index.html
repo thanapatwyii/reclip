@@ -478,38 +478,11 @@
         }
       }
 
-      for (let i = 0; i < urls.length; i++) {
-        const url = urls[i];
-        const idx = cardData.length;
+      for (const url of urls) {
         cardData.push({ url, status: 'loading' });
-        renderCard(idx);
-
-        try {
-          const res = await fetch('/api/info', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url }),
-          });
-          const data = await res.json();
-          if (data.error) {
-            cardData[idx] = { ...cardData[idx], status: 'info-error', error: data.error };
-          } else {
-            cardData[idx] = {
-              ...cardData[idx],
-              status: 'ready',
-              title: data.title || '',
-              thumbnail: data.thumbnail || '',
-              duration: data.duration,
-              uploader: data.uploader || '',
-              formats: data.formats || [],
-              selectedFormatId: data.formats?.[0]?.id || null,
-            };
-          }
-        } catch (err) {
-          cardData[idx] = { ...cardData[idx], status: 'info-error', error: err.message };
-        }
-        renderCard(idx);
+        renderCard(cardData.length - 1);
       }
+      await Promise.all(cardData.map((_, idx) => fetchInfo(idx)));
 
       if (cardData.filter(c => c.status === 'ready').length > 1) {
         renderDownloadAll();
@@ -517,6 +490,41 @@
 
       btn.disabled = false;
       btn.textContent = 'Fetch';
+    }
+
+    // Keep asking for the video info until it loads (up to ~20 tries).
+    async function fetchInfo(idx) {
+      const url = cardData[idx].url;
+      for (let attempt = 1; attempt <= 20; attempt++) {
+        let data;
+        try {
+          const res = await fetch('/api/info', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url }),
+          });
+          data = await res.json();
+        } catch (err) {
+          data = { error: err.message };
+        }
+        if (!data.error) {
+          cardData[idx] = {
+            ...cardData[idx],
+            status: 'ready',
+            title: data.title || '',
+            thumbnail: data.thumbnail || '',
+            duration: data.duration,
+            uploader: data.uploader || '',
+            formats: data.formats || [],
+            selectedFormatId: data.formats?.[0]?.id || null,
+          };
+          renderCard(idx);
+          return;
+        }
+        cardData[idx] = { ...cardData[idx], status: 'info-error', error: data.error, infoAttempt: attempt };
+        renderCard(idx);
+        await new Promise(r => setTimeout(r, Math.min(5000 * attempt, 30000)));
+      }
     }
 
     function renderCard(idx) {
@@ -555,6 +563,7 @@
             <div class="card-title" style="color:var(--error)">Could not fetch video</div>
             <div class="card-error-msg">${esc(friendlyError(c.error || ''))}</div>
             <div class="card-error-url">${esc(c.url)}</div>
+            ${c.infoAttempt && c.infoAttempt < 20 ? `<div class="card-error-msg">Trying again… (attempt ${c.infoAttempt + 1})</div>` : ''}
           </div>
         `;
         return;
@@ -584,10 +593,12 @@
       if (c.status === 'ready') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
       } else if (c.status === 'downloading') {
-        actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
+        const mb = c.bytes ? ` · ${(c.bytes / 1048576).toFixed(0)} MB` : '';
+        const tries = c.attempts > 1 ? ` · try ${c.attempts}` : '';
+        const label = c.serverStatus === 'retrying' ? 'Retrying soon' : c.serverStatus === 'queued' ? 'Waiting in line' : 'Downloading';
+        actionHtml = `<span class="card-status downloading"><span class="spin"></span> ${label}${mb}${tries}</span>`;
       } else if (c.status === 'done') {
-        actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save</button>
-          <span class="card-status done">${esc(c.filename || '')}</span>`;
+        actionHtml = `<span class="card-status done">✓ Saved to Downloads · ${esc(c.filename || '')}</span>`;
       } else if (c.status === 'error') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
           <span class="card-status error">${esc(friendlyError(c.error || 'Download failed'))}</span>`;
@@ -663,20 +674,21 @@
             c.status = 'done';
             c.filename = data.filename;
             renderCard(idx);
-            saveCard(idx);
-          } else if (data.status === 'error') {
+          } else if (['queued', 'downloading', 'retrying'].includes(data.status)) {
+            c.serverStatus = data.status;
+            c.attempts = data.attempts;
+            c.bytes = data.bytes;
+            renderCard(idx);
+          } else if (data.status === 'error' || data.status === 'cancelled') {
             clearInterval(iv);
             c.status = 'error';
             c.error = data.error;
             renderCard(idx);
           }
         } catch {
-          clearInterval(iv);
-          c.status = 'error';
-          c.error = 'Lost connection to server';
-          renderCard(idx);
+          // Server restarting or busy: keep polling, the job is saved on disk.
         }
-      }, 1000);
+      }, 2000);
     }
 
     function saveCard(idx) {
