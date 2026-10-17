@@ -70,6 +70,30 @@ def unique_path(path):
     return path
 
 
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_progress(job, stdout):
+    """Turn yt-dlp's progress lines into job["progress"] for the page's bar."""
+    for line in stdout:
+        line = line.strip()
+        if line.startswith("PROG|"):
+            _, vcodec, done, total, estimate, speed, eta = (line.split("|") + [""] * 7)[:7]
+            done, total = _num(done), _num(total) or _num(estimate)
+            job["progress"] = {
+                "stage": "audio" if vcodec == "none" else "video",
+                "percent": round(done / total * 100, 1) if done and total else None,
+                "speed": _num(speed),
+                "eta": _num(eta),
+            }
+        elif line.startswith(("[Merger]", "[ExtractAudio]", "[VideoConvertor]")):
+            job["progress"] = {"stage": "finishing", "percent": 100}
+
+
 def start_worker(job_id):
     thread = threading.Thread(target=download_until_done, args=(job_id,))
     thread.daemon = True
@@ -119,7 +143,10 @@ def run_download(job_id, url, format_choice, format_id):
     out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
 
     cmd = ["yt-dlp", "--no-playlist", "--continue", "--retries", "20",
-           "--fragment-retries", "20", "-o", out_template]
+           "--fragment-retries", "20", "--newline", "--progress-template",
+           "download:PROG|%(info.vcodec)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s"
+           "|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
+           "-o", out_template]
 
     if format_choice == "audio":
         cmd += ["-x", "--audio-format", "mp3"]
@@ -131,11 +158,13 @@ def run_download(job_id, url, format_choice, format_id):
     cmd.append(url)
 
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         job["proc"] = proc
+        job["progress"] = {"stage": "starting"}
         stderr_lines = []
         reader = threading.Thread(target=lambda: stderr_lines.extend(proc.stderr), daemon=True)
         reader.start()
+        threading.Thread(target=read_progress, args=(job, proc.stdout), daemon=True).start()
 
         # No total time limit: only kill it when the file stops growing.
         last_size, last_change = partial_size(job_id), time.time()
@@ -317,6 +346,7 @@ def job_summary(job_id, job):
         "url": job.get("url"),
         "attempts": job.get("attempts", 0),
         "bytes": job.get("bytes", 0),
+        "progress": job.get("progress") if job["status"] == "downloading" else None,
     }
 
 

@@ -267,6 +267,44 @@
       color: var(--muted);
     }
     .card-status.downloading { color: var(--accent); }
+    .dl-progress { width: 100%; }
+    .dl-bar {
+      height: 8px;
+      border-radius: 99px;
+      background: var(--card-border);
+      overflow: hidden;
+      margin: 2px 0 6px;
+    }
+    .dl-bar-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 99px;
+      transition: width 0.6s ease;
+    }
+    .dl-bar.waiting .dl-bar-fill {
+      width: 35% !important;
+      animation: dl-slide 1.4s ease-in-out infinite;
+      opacity: 0.5;
+    }
+    @keyframes dl-slide { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
+    .dl-line {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 0.72rem;
+      color: var(--muted);
+    }
+    .dl-line b { color: var(--accent); font-weight: 500; }
+    .dl-cancel {
+      background: none;
+      border: none;
+      color: var(--muted);
+      font: inherit;
+      text-decoration: underline;
+      cursor: pointer;
+      padding: 0;
+    }
+    .dl-cancel:hover { color: var(--error); }
     .card-status.done { color: var(--success); }
     .card-status.error { color: var(--error); }
 
@@ -593,10 +631,7 @@
       if (c.status === 'ready') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Download</button>${qualityChips}`;
       } else if (c.status === 'downloading') {
-        const mb = c.bytes ? ` · ${(c.bytes / 1048576).toFixed(0)} MB` : '';
-        const tries = c.attempts > 1 ? ` · try ${c.attempts}` : '';
-        const label = c.serverStatus === 'retrying' ? 'Retrying soon' : c.serverStatus === 'queued' ? 'Waiting in line' : 'Downloading';
-        actionHtml = `<span class="card-status downloading"><span class="spin"></span> ${label}${mb}${tries}</span>`;
+        actionHtml = progressHtml(c, idx);
       } else if (c.status === 'done') {
         actionHtml = `<span class="card-status done">✓ Saved to Downloads · ${esc(c.filename || '')}</span>`;
       } else if (c.status === 'error') {
@@ -612,6 +647,44 @@
           <div class="card-actions">${actionHtml}</div>
         </div>
       `;
+    }
+
+    function fmtEta(sec) {
+      if (!sec || sec < 0) return '';
+      if (sec < 60) return `${Math.round(sec)}s left`;
+      if (sec < 3600) return `${Math.round(sec / 60)} min left`;
+      return `${(sec / 3600).toFixed(1)} h left`;
+    }
+
+    function progressHtml(c, idx) {
+      const p = c.progress || {};
+      const pct = typeof p.percent === 'number' ? Math.min(p.percent, 100) : null;
+      const mb = c.bytes ? `${(c.bytes / 1048576).toFixed(0)} MB` : '';
+      const tries = c.attempts > 1 ? `try ${c.attempts}` : '';
+      let label, detail = [];
+      if (c.serverStatus === 'queued') label = 'Waiting for a free slot';
+      else if (c.serverStatus === 'retrying') label = 'Connection dropped, trying again soon';
+      else if (p.stage === 'finishing') label = 'Finishing up';
+      else if (pct === null) label = 'Starting';
+      else {
+        label = `<b>${pct.toFixed(0)}%</b>${p.stage === 'audio' ? ' · sound' : ''}`;
+        if (p.speed) detail.push(p.speed >= 1048576 ? `${(p.speed / 1048576).toFixed(1)} MB/s` : `${Math.round(p.speed / 1024)} KB/s`);
+        if (p.eta) detail.push(fmtEta(p.eta));
+      }
+      if (mb) detail.push(mb);
+      if (tries) detail.push(tries);
+      const moving = pct !== null && c.serverStatus === 'downloading' && p.stage !== 'finishing';
+      return `<div class="dl-progress">
+          <div class="dl-bar${moving ? '' : ' waiting'}"><div class="dl-bar-fill" style="width:${moving ? pct : 0}%"></div></div>
+          <div class="dl-line"><span>${label}${detail.length ? ' · ' + detail.join(' · ') : ''}</span>
+            <button class="dl-cancel" onclick="cancelCard(${idx})">Cancel</button></div>
+        </div>`;
+    }
+
+    async function cancelCard(idx) {
+      const c = cardData[idx];
+      if (!c.jobId) return;
+      await fetch(`/api/cancel/${c.jobId}`, { method: 'POST' }).catch(() => {});
     }
 
     function renderDownloadAll() {
@@ -678,11 +751,12 @@
             c.serverStatus = data.status;
             c.attempts = data.attempts;
             c.bytes = data.bytes;
+            c.progress = data.progress;
             renderCard(idx);
           } else if (data.status === 'error' || data.status === 'cancelled') {
             clearInterval(iv);
             c.status = 'error';
-            c.error = data.error;
+            c.error = data.status === 'cancelled' ? 'Cancelled' : data.error;
             renderCard(idx);
           }
         } catch {
