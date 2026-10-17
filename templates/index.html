@@ -449,6 +449,25 @@
     let currentFormat = 'video';
     let cardData = [];
 
+    // Tag this tab so the server can close exactly this one when it's done.
+    const TAB_ID = (location.hash.match(/^#tab-(\w+)$/) || [])[1] || Math.random().toString(36).slice(2, 10);
+    history.replaceState(null, '', `${location.pathname}#tab-${TAB_ID}`);
+
+    function closeTabIfAllDone() {
+      if (!cardData.length || !cardData.every(c => c.status === 'done')) return;
+      setTimeout(() => {
+        window.close();
+        // Chrome blocks scripts from closing tabs you opened yourself; ask the server.
+        setTimeout(() => {
+          fetch('/api/close-tab', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tab: TAB_ID }),
+          }).catch(() => {});
+        }, 500);
+      }, 3000);
+    }
+
     function setFormat(btn) {
       document.querySelectorAll('.pill').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
@@ -557,6 +576,7 @@
             selectedFormatId: data.formats?.[0]?.id || null,
           };
           renderCard(idx);
+          dlCard(idx);  // join the shared line right away, no click needed
           return;
         }
         cardData[idx] = { ...cardData[idx], status: 'info-error', error: data.error, infoAttempt: attempt };
@@ -748,6 +768,7 @@
             c.status = 'done';
             c.filename = data.filename;
             renderCard(idx);
+            closeTabIfAllDone();
           } else if (['queued', 'downloading', 'retrying'].includes(data.status)) {
             c.serverStatus = data.status;
             c.attempts = data.attempts;

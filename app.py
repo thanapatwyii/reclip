@@ -376,6 +376,26 @@ def list_jobs():
     return jsonify([job_summary(k, j) for k, j in items])
 
 
+@app.route("/api/close-tab", methods=["POST"])
+def close_tab():
+    """Close the Chrome tab whose address ends in #tab-<id> (all its videos are done)."""
+    tab = "".join(c for c in (request.json or {}).get("tab", "") if c.isalnum())
+    if not tab:
+        return jsonify({"error": "No tab id"}), 400
+    script = f'''
+    tell application "Google Chrome"
+        repeat with w in windows
+            repeat with t in (tabs of w)
+                if URL of t ends with "#tab-{tab}" then close t
+            end repeat
+        end repeat
+    end tell'''
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+    if result.returncode != 0:
+        return jsonify({"error": result.stderr.strip()}), 500
+    return jsonify({"ok": True})
+
+
 @app.route("/api/cancel/<job_id>", methods=["POST"])
 def cancel_job(job_id):
     job = jobs.get(job_id)
