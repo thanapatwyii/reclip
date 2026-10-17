@@ -633,7 +633,7 @@
       } else if (c.status === 'downloading') {
         actionHtml = progressHtml(c, idx);
       } else if (c.status === 'done') {
-        actionHtml = `<span class="card-status done">✓ Saved to Downloads · ${esc(c.filename || '')}</span>`;
+        actionHtml = `<span class="card-status done">✓ Saved to Movies › Personal › Misc · ${esc(c.filename || '')}</span>`;
       } else if (c.status === 'error') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
           <span class="card-status error">${esc(friendlyError(c.error || 'Download failed'))}</span>`;
@@ -662,8 +662,9 @@
       const mb = c.bytes ? `${(c.bytes / 1048576).toFixed(0)} MB` : '';
       const tries = c.attempts > 1 ? `try ${c.attempts}` : '';
       let label, detail = [];
-      if (c.serverStatus === 'queued') label = 'Waiting for a free slot';
-      else if (c.serverStatus === 'retrying') label = 'Connection dropped, trying again soon';
+      const spot = c.position > 1 ? ` · #${c.position} in line` : '';
+      if (c.serverStatus === 'queued') label = `Waiting its turn${spot}`;
+      else if (c.serverStatus === 'retrying') label = `Connection dropped, will try again${spot}`;
       else if (p.stage === 'finishing') label = 'Finishing up';
       else if (pct === null) label = 'Starting';
       else {
@@ -752,6 +753,7 @@
             c.attempts = data.attempts;
             c.bytes = data.bytes;
             c.progress = data.progress;
+            c.position = data.position;
             renderCard(idx);
           } else if (data.status === 'error' || data.status === 'cancelled') {
             clearInterval(iv);

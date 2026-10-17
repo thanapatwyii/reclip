@@ -12,11 +12,10 @@ app = Flask(__name__)
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-SAVE_DIR = os.path.expanduser(os.environ.get("RECLIP_SAVE_DIR", "~/Downloads"))
+SAVE_DIR = os.path.expanduser(os.environ.get("RECLIP_SAVE_DIR", "~/Movies/Personal/Misc"))
 QUEUE_FILE = os.path.join(DOWNLOAD_DIR, "queue.json")
 MAX_ATTEMPTS = int(os.environ.get("RECLIP_MAX_ATTEMPTS", 50))
 STALL_SECONDS = int(os.environ.get("RECLIP_STALL_SECONDS", 180))
-MAX_PARALLEL = int(os.environ.get("RECLIP_PARALLEL", 4))
 
 # Errors that retrying will never fix: stop after 3 tries instead of 50.
 PERMANENT_ERRORS = ("Unsupported URL", "Video unavailable", "Private video", "not available",
@@ -24,7 +23,8 @@ PERMANENT_ERRORS = ("Unsupported URL", "Video unavailable", "Private video", "no
 
 jobs = {}
 jobs_lock = threading.RLock()
-slots = threading.Semaphore(MAX_PARALLEL)
+wake = threading.Event()  # nudges the queue runner when a job is added
+ACTIVE = ("queued", "downloading", "retrying")
 
 
 def save_queue():
@@ -45,9 +45,9 @@ def load_queue():
             jobs.update(json.load(fh))
     except (OSError, ValueError):
         return
-    for job_id, job in jobs.items():
-        if job["status"] in ("queued", "downloading", "retrying"):
-            start_worker(job_id)
+    for job in jobs.values():
+        if job["status"] == "downloading":
+            job["status"] = "queued"  # it resumes when its turn comes
 
 
 def job_key(url, format_choice, format_id):
@@ -94,32 +94,51 @@ def read_progress(job, stdout):
             job["progress"] = {"stage": "finishing", "percent": 100}
 
 
-def start_worker(job_id):
-    thread = threading.Thread(target=download_until_done, args=(job_id,))
-    thread.daemon = True
-    thread.start()
+def line_order():
+    """Jobs waiting their turn, oldest first (shared by every tab)."""
+    waiting = [(k, j) for k, j in list(jobs.items()) if j["status"] in ACTIVE]
+    return [k for k, _ in sorted(waiting, key=lambda kv: kv[1].get("added", 0))]
 
 
-def download_until_done(job_id):
-    """Retry (resuming the partial file) until the download succeeds."""
-    job = jobs[job_id]
-    with slots:
-        while job["status"] not in ("done", "cancelled"):
-            job["attempts"] = job.get("attempts", 0) + 1
-            job["status"] = "downloading"
-            save_queue()
-            if run_download(job_id, job["url"], job["format"], job.get("format_id")):
-                return
-            if job["status"] == "cancelled":
-                return
-            hopeless = any(p in (job.get("error") or "") for p in PERMANENT_ERRORS)
-            if job["attempts"] >= MAX_ATTEMPTS or (hopeless and job["attempts"] >= 3):
-                job["status"] = "error"
-                save_queue()
-                return
+def next_ready():
+    now = time.time()
+    for job_id in line_order():
+        if jobs[job_id].get("next_try", 0) <= now:
+            return job_id
+    return None
+
+
+def queue_runner():
+    """Download ONE video at a time across all tabs, oldest first.
+
+    A failed video goes back in line (after a short wait) so it never
+    blocks the others; it resumes its partial file on its next turn.
+    """
+    while True:
+        job_id = next_ready()
+        if not job_id:
+            wake.wait(5)
+            wake.clear()
+            continue
+        job = jobs[job_id]
+        job["attempts"] = job.get("attempts", 0) + 1
+        job["status"] = "downloading"
+        save_queue()
+        if run_download(job_id, job["url"], job["format"], job.get("format_id")):
+            continue
+        if job["status"] == "cancelled":
+            continue
+        hopeless = any(p in (job.get("error") or "") for p in PERMANENT_ERRORS)
+        if job["attempts"] >= MAX_ATTEMPTS or (hopeless and job["attempts"] >= 3):
+            job["status"] = "error"
+        else:
             job["status"] = "retrying"
-            save_queue()
-            time.sleep(min(10 * job["attempts"], 120))
+            job["next_try"] = time.time() + min(10 * job["attempts"], 120)
+        save_queue()
+
+
+def start_worker(job_id):
+    wake.set()
 
 
 def parse_ytdlp_json(stdout):
@@ -347,6 +366,7 @@ def job_summary(job_id, job):
         "attempts": job.get("attempts", 0),
         "bytes": job.get("bytes", 0),
         "progress": job.get("progress") if job["status"] == "downloading" else None,
+        "position": line_order().index(job_id) + 1 if job["status"] in ACTIVE else None,
     }
 
 
@@ -378,6 +398,7 @@ def download_file(job_id):
 
 
 load_queue()
+threading.Thread(target=queue_runner, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8899))
