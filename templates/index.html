@@ -453,6 +453,21 @@
     const TAB_ID = (location.hash.match(/^#tab-(\w+)$/) || [])[1] || Math.random().toString(36).slice(2, 10);
     history.replaceState(null, '', `${location.pathname}#tab-${TAB_ID}`);
 
+    // Remember this tab's videos so a reload (or an update) picks them back up.
+    const SAVED_KEY = `reclip-${TAB_ID}`;
+    function rememberTab(urls) {
+      try { sessionStorage.setItem(SAVED_KEY, JSON.stringify({ urls, format: currentFormat })); } catch {}
+    }
+
+    // When the app is updated, reload so this tab never runs an old copy of the page.
+    const PAGE_VERSION = '{{ version }}';
+    setInterval(async () => {
+      try {
+        const v = (await (await fetch('/api/version')).json()).version;
+        if (v && v !== PAGE_VERSION) location.reload();
+      } catch {}  // server restarting: try again next tick
+    }, 10000);
+
     function closeTabIfAllDone() {
       if (!cardData.length || !cardData.every(c => c.status === 'done')) return;
       setTimeout(() => {
@@ -511,6 +526,7 @@
     async function go() {
       const urls = parseUrls(document.getElementById('urls').value);
       if (!urls.length) return;
+      rememberTab(urls);
 
       const btn = document.getElementById('goBtn');
       const container = document.getElementById('cards');
@@ -788,15 +804,6 @@
       }, 2000);
     }
 
-    function saveCard(idx) {
-      const c = cardData[idx];
-      if (!c.jobId) return;
-      const a = document.createElement('a');
-      a.href = `/api/file/${c.jobId}`;
-      a.download = c.filename || '';
-      a.click();
-    }
-
     async function dlAll() {
       const btn = document.querySelector('.dl-all-btn');
       if (btn) { btn.disabled = true; btn.textContent = 'Downloading...'; }
@@ -809,6 +816,17 @@
 
       if (btn) { btn.disabled = false; btn.textContent = 'Download All'; }
     }
+
+    // Pick up where this tab left off after a reload.
+    (() => {
+      let saved;
+      try { saved = JSON.parse(sessionStorage.getItem(SAVED_KEY) || 'null'); } catch {}
+      if (!saved?.urls?.length) return;
+      const pill = document.querySelector(`.pill[data-format="${saved.format}"]`);
+      if (pill) setFormat(pill);
+      document.getElementById('urls').value = saved.urls.join('\n');
+      go();
+    })();
   </script>
 </body>
 </html>

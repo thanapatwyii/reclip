@@ -9,6 +9,7 @@ import threading
 from flask import Flask, request, jsonify, send_file, render_template
 
 app = Flask(__name__)
+app.config["TEMPLATES_AUTO_RELOAD"] = True  # page edits apply without a restart
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -249,9 +250,24 @@ def run_download(job_id, url, format_choice, format_id):
         job.pop("proc", None)
 
 
+def page_version():
+    """Changes whenever the page or server code changes, so open tabs reload themselves."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    stamp = "|".join(str(os.path.getmtime(os.path.join(here, f))) for f in ("app.py", "templates/index.html"))
+    return hashlib.sha1(f"{BOOT}|{stamp}".encode()).hexdigest()[:10]
+
+
+BOOT = str(time.time())
+
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", version=page_version())
+
+
+@app.route("/api/version")
+def version():
+    return jsonify({"version": page_version()})
 
 
 @app.route("/api/info", methods=["POST"])
